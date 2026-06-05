@@ -1,0 +1,12 @@
+SECRET_KEY = "tests"
+ROOT_URLCONF = "tests.urls"
+USE_TZ = True
+ALLOWED_HOSTS = ["*"]
+INSTALLED_APPS = ["django.contrib.contenttypes", "ratelimit_middleware"]
+MIDDLEWARE = ["ratelimit_middleware.middleware.RateLimitMiddleware"]
+DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}}
+RATELIMIT_RATE = 2
+RATELIMIT_WINDOW = 60
+RATELIMIT_REDIS_URL = "redis://localhost:6379/15"
+RATELIMIT_FAIL_OPEN = False
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

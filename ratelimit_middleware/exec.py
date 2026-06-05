@@ -1,4 +1,3 @@
+from .middleware import RateLimitExceeded
 
-class RateLimitExceeded(Exception):
-    """Exception raised when rate limit is exceeded."""
-    pass
+__all__ = ["RateLimitExceeded"]

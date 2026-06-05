@@ -7,3 +7,5 @@ class RatelimitMiddlewareConfig(AppConfig):
     name = "ratelimit_middleware"
     verbose_name = _("Django Ratelimit Middleware")
 
+    def ready(self):
+        from . import checks  # noqa: F401
