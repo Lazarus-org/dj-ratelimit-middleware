@@ -1,0 +1,26 @@
+name: Release candidate build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: Build candidate wheel (no publish)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Build distribution
+        run: uv build --wheel --force-pep517
+      - name: Inspect wheel
+        run: uv run --no-project python scripts/check_wheel.py dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dj-ratelimit-middleware-wheel
+          path: dist/*.whl
+          if-no-files-found: error

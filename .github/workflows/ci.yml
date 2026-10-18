@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: ${{ matrix.tox-env }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { tox-env: py314-django61-drf318, python-version: "3.14" }
+          - { tox-env: py314-django60-drf318, python-version: "3.14" }
+          - { tox-env: py314-django52-drf318, python-version: "3.14" }
+          - { tox-env: py313-django61-drf318, python-version: "3.13" }
+          - { tox-env: py313-django60-drf318, python-version: "3.13" }
+          - { tox-env: py313-django52-drf318, python-version: "3.13" }
+          - { tox-env: py312-django61-drf318, python-version: "3.12" }
+          - { tox-env: py312-django60-drf318, python-version: "3.12" }
+          - { tox-env: py312-django52-drf318, python-version: "3.12" }
+          - { tox-env: py311-django52-drf318, python-version: "3.11" }
+          - { tox-env: py310-django52-drf318, python-version: "3.10" }
+          - { tox-env: py310-django52-drfmin, python-version: "3.10" }
+          - { tox-env: py314-django61-drfmin, python-version: "3.14" }
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis5:
+        image: redis:5-alpine
+        ports:
+          - 6381:6379
+      memcached:
+        image: memcached:1.6-alpine
+        ports:
+          - 11211:11211
+    env:
+      RATELIMIT_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+      RATELIMIT_TEST_REDIS5_URL: redis://127.0.0.1:6381/0
+      RATELIMIT_TEST_MEMCACHED_URL: 127.0.0.1:11211
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Run tox compatibility tests
+        run: uvx --from 'tox>=4.16,<5' tox -e '${{ matrix.tox-env }}'
+
+  quality:
+    name: Source and packaging checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --python 3.12 --group dev --extra redis --extra drf
+      - name: Pre-commit CI hooks
+        run: uv run --no-sync pre-commit run --all-files --config .pre-commit-config-ci.yaml
+      - name: Build wheel
+        run: uv build --wheel --force-pep517
+      - name: Inspect wheel
+        run: uv run --no-sync python scripts/check_wheel.py dist/

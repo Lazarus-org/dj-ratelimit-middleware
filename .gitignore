@@ -138,3 +138,10 @@ nginx.conf
 test_app/
 myenv/
 myenv3_8/
+# uv lockfiles are intentionally tracked (not ignored).
+# uv workspace and tool caches
+.uv-cache/
+.ruff_cache/
+
+# Local stabilization evidence and baseline snapshots
+.validation/
