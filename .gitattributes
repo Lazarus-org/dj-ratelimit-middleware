@@ -1,0 +1,6 @@
+# GitHub workflow/action YAML must use LF for Dependabot compatibility.
+.github/workflows/*.yml text eol=lf
+.github/workflows/*.yaml text eol=lf
+.github/actions/**/action.yml text eol=lf
+.github/actions/**/action.yaml text eol=lf
+.github/dependabot.yml text eol=lf
