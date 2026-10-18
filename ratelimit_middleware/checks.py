@@ -17,7 +17,7 @@ from .constants import (
     STORAGE_REDIS,
 )
 from .conf import config_errors
-from .policies import PolicyConfigurationError, compile_policies
+from .policies import compile_policies
 
 
 @register()
@@ -65,13 +65,11 @@ def ratelimit_settings_check(app_configs, **kwargs):
         )
 
     raw_policies = getattr(settings, "RATELIMIT_POLICIES", ())
-    try:
-        policies = compile_policies(
-            raw_policies,
-            has_custom_resolver=bool(getattr(settings, "RATELIMIT_IDENTITY_RESOLVER", None)),
-        )
-    except PolicyConfigurationError:
-        policies = ()  # An E016 error is already returned by config_errors().
+    # config_errors() already validates policies and returns above on E016.
+    policies = compile_policies(
+        raw_policies,
+        has_custom_resolver=bool(getattr(settings, "RATELIMIT_IDENTITY_RESOLVER", None)),
+    )
     if backend == STORAGE_CACHE and any(len(rule.limits) > 1 for rule in policies):
         findings.append(
             Warning(

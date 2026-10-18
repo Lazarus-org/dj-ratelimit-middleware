@@ -81,6 +81,7 @@ branch = true
 
 [tool.coverage.report]
 show_missing = true
+fail_under = 100
 exclude_also = ["if TYPE_CHECKING:"]
 
 [tool.ruff]
