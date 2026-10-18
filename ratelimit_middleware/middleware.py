@@ -2,24 +2,25 @@ from __future__ import annotations
 
 import json
 import logging
-import time
-import uuid
 from typing import Awaitable, Callable, Optional, Union
 
 from asgiref.sync import iscoroutinefunction, markcoroutinefunction
 from django.http import HttpRequest, HttpResponse, HttpResponseBase
+from django.core.exceptions import ImproperlyConfigured
+from django.utils.functional import SimpleLazyObject
 from django.utils.translation import gettext_lazy as _
-from redis import Redis
-from redis.asyncio import Redis as AsyncRedis
-from redis.exceptions import RedisError
 
+from .constants import IDENTITY_USER
 from .conf import get_ratelimit_settings
+from .identity import client_ip, is_exempt_path
+from .principals import choose_identity, principal_key
+from .policies import PolicyDecision, match_policy
+from .policy_admission import admit_sync, admit_async
+from django.utils.module_loading import import_string
+from .sliding_window import SlidingWindowResult
+from .storage import StorageError, make_storage
 
 logger = logging.getLogger(__name__)
-
-
-class RateLimitExceeded(Exception):
-    """Raised internally when a request exceeds the configured rate limit."""
 
 
 class BaseRateLimit:
@@ -33,43 +34,58 @@ class BaseRateLimit:
     def __init__(self) -> None:
         """Load rate-limit settings once when the middleware is instantiated."""
         self.cfg = get_ratelimit_settings()
+        self._storage = make_storage(self.cfg)
+        self._identity_resolver = (
+            import_string(self.cfg.identity_resolver) if self.cfg.identity_resolver else None
+        )
 
     def _client_ip_from_meta(self, request: HttpRequest) -> str:
-        """Return the client IP address for a Django ``HttpRequest``.
-
-        ``X-Forwarded-For`` is only trusted when explicitly enabled. This is
-        important because clients can spoof this header when Django is exposed
-        directly to the internet.
-        """
-        if self.cfg.trust_x_forwarded_for:
-            xff = request.META.get("HTTP_X_FORWARDED_FOR")
-            if xff:
-                # The first value is the original client in the common proxy
-                # chain format: client, proxy1, proxy2.
-                return xff.split(",")[0].strip()
-        return request.META.get("REMOTE_ADDR", "") or ""
+        """Resolve the client from the socket peer and configured trusted chain."""
+        return client_ip(
+            request.META.get("REMOTE_ADDR"),
+            request.META.get("HTTP_X_FORWARDED_FOR"),
+            trust_forwarded=self.cfg.trust_x_forwarded_for,
+            trusted_proxies=self.cfg.trusted_proxies,
+        )
 
     def is_exempt_request(self, request: HttpRequest) -> bool:
-        """Return ``True`` when the current request should skip rate limiting."""
-        path = request.path_info.lstrip("/")
-        path_is_exempt = any(
-            path.startswith(exempt_path.lstrip("/"))
-            for exempt_path in self.cfg.exempt_paths
+        """Only exact paths or explicit subtrees and canonical IPs are exempt."""
+        return is_exempt_path(request.path_info, self.cfg.exempt_paths) or (
+            bool(self.cfg.exempt_ips) and self._client_ip_from_meta(request) in self.cfg.exempt_ips
         )
-        ip_is_exempt = self._client_ip_from_meta(request) in self.cfg.exempt_ips
-        return path_is_exempt or ip_is_exempt
 
     def key_for_request(self, request: HttpRequest, suffix: str = "http") -> str:
-        """Build the Redis key used to count requests for this client.
+        """Resolve an opt-in principal; IP remains the no-authentication default."""
+        user = (
+            getattr(request, IDENTITY_USER, None)
+            if self.cfg.identity_mode == IDENTITY_USER
+            else None
+        )
+        identity = choose_identity(
+            self.cfg.identity_mode, request, user=user, resolver=self._identity_resolver
+        )
+        return principal_key(suffix, self._client_ip_from_meta(request), identity)
 
-        The default identity is per IP address. When ``include_user_agent`` is
-        enabled, the user agent is appended to reduce collisions between many
-        clients sharing the same NAT IP address.
-        """
-        parts = ["ratelimit", suffix, self._client_ip_from_meta(request)]
-        if self.cfg.include_user_agent:
-            parts.append(request.META.get("HTTP_USER_AGENT", "") or "")
-        return ":".join(parts)
+    async def async_key_for_request(self, request: HttpRequest, suffix: str = "http") -> str:
+        """Obtain Django session principals using its async API when available."""
+        user = None
+        if self.cfg.identity_mode == IDENTITY_USER:
+            # Prefer an already-verified principal supplied by upstream custom
+            # authentication. This avoids fetching the session user again.
+            candidate = getattr(request, IDENTITY_USER, None)
+            if candidate is not None and type(candidate) is not SimpleLazyObject:
+                user = candidate
+            else:
+                auser = getattr(request, "auser", None)
+                if not callable(auser):
+                    raise ImproperlyConfigured(
+                        "Async user limiting needs a resolved request.user or request.auser()."
+                    )
+                user = await auser()
+        identity = choose_identity(
+            self.cfg.identity_mode, request, user=user, resolver=self._identity_resolver
+        )
+        return principal_key(suffix, self._client_ip_from_meta(request), identity)
 
     def add_headers(
         self,
@@ -77,6 +93,8 @@ class BaseRateLimit:
         count: int,
         limit: Optional[int] = None,
         window: Optional[int] = None,
+        *,
+        reset_after: Optional[int] = None,
     ) -> None:
         """Attach optional rate-limit headers to an HTTP response."""
         if not self.cfg.enable_headers:
@@ -86,41 +104,39 @@ class BaseRateLimit:
         window = self.cfg.window if window is None else window
         response["X-RateLimit-Limit"] = str(limit)
         response["X-RateLimit-Remaining"] = str(max(0, limit - count))
-        response["X-RateLimit-Reset"] = str(window)
+        response["X-RateLimit-Reset"] = str(window if reset_after is None else reset_after)
 
     def build_429(
         self,
         count: int,
         limit: Optional[int] = None,
         window: Optional[int] = None,
+        *,
+        reset_after: Optional[int] = None,
     ) -> HttpResponse:
         """Build a translated JSON ``429 Too Many Requests`` response."""
         limit = self.cfg.rate if limit is None else limit
         window = self.cfg.window if window is None else window
+        retry_after = window if reset_after is None else reset_after
 
         # Keep user-facing strings lazy so Django can translate them at render
         # time according to the active language.
         payload = {
             "error": str(_("Rate limit exceeded")),
-            "detail": str(_("Please try again in %(seconds)s seconds") % {"seconds": window}),
+            "detail": str(_("Please try again in %(seconds)s seconds") % {"seconds": retry_after}),
         }
         response = HttpResponse(
             json.dumps(payload),
             status=429,
             content_type="application/json",
         )
-        response["Retry-After"] = str(window)
-        self.add_headers(response, count, limit, window)
+        response["Retry-After"] = str(retry_after)
+        self.add_headers(response, count, limit, window, reset_after=retry_after)
         return response
 
 
 class RateLimitMiddleware(BaseRateLimit):
-    """Django middleware that rate-limits WSGI and ASGI HTTP requests.
-
-    Redis sorted sets are used as a sliding-window counter. Each request stores
-    a unique member with the current timestamp, removes expired timestamps, and
-    counts the remaining members inside the configured time window.
-    """
+    """Django middleware for WSGI and ASGI with pluggable rate-limit storage."""
 
     sync_capable = True
     async_capable = True
@@ -135,84 +151,103 @@ class RateLimitMiddleware(BaseRateLimit):
         self.async_mode = iscoroutinefunction(get_response)
         if self.async_mode:
             markcoroutinefunction(self)
-        self._redis_sync: Optional[Redis] = None
-        self._redis_async: Optional[AsyncRedis] = None
 
-    def _get_sync_redis(self) -> Redis:
-        """Create or return the cached synchronous Redis client."""
-        if self._redis_sync is None:
-            self._redis_sync = Redis.from_url(
-                self.cfg.redis_url,
-                socket_timeout=self.cfg.redis_timeout,
-                socket_connect_timeout=self.cfg.redis_timeout,
-                decode_responses=True,
+    def _selected_policy(self, request: HttpRequest):
+        return match_policy(self.cfg.policies, request.path_info, request.method)
+
+    async def _policy_async_user(self, request: HttpRequest):
+        """Resolve an authenticated Django user only when the policy needs it."""
+        candidate = getattr(request, IDENTITY_USER, None)
+        if candidate is not None and type(candidate) is not SimpleLazyObject:
+            return candidate
+        auser = getattr(request, "auser", None)
+        if not callable(auser):
+            raise ImproperlyConfigured(
+                "Async user limiting needs a resolved request.user or request.auser()."
             )
-        return self._redis_sync
+        return await auser()
 
-    def _get_async_redis(self) -> AsyncRedis:
-        """Create or return the cached asynchronous Redis client."""
-        if self._redis_async is None:
-            self._redis_async = AsyncRedis.from_url(
-                self.cfg.redis_url,
-                socket_timeout=self.cfg.redis_timeout,
-                socket_connect_timeout=self.cfg.redis_timeout,
-                decode_responses=True,
+    def _failed(self, limit: int, window: int) -> PolicyDecision:
+        return PolicyDecision(
+            SlidingWindowResult(
+                limited=not self.cfg.fail_open,
+                count=0 if self.cfg.fail_open else limit + 1,
+                reset_after=window,
+            ),
+            limit,
+            window,
+        )
+
+    def _admit_sync(self, request: HttpRequest) -> PolicyDecision:
+        """Admit the first matching policy, or the global default quota."""
+        if self.is_exempt_request(request):
+            return PolicyDecision(
+                SlidingWindowResult(False, 0, self.cfg.window), self.cfg.rate, self.cfg.window
             )
-        return self._redis_async
-
-    def _member(self) -> str:
-        """Return a unique sorted-set member for a single request."""
-        return f"{time.time()}:{uuid.uuid4().hex}"
-
-    def should_limit_sync(self, request: HttpRequest) -> tuple[bool, int]:
-        """Check the rate limit for a synchronous Django request."""
-        if self.is_exempt_request(request):
-            return False, 0
-
-        key = self.key_for_request(request)
-        now = time.time()
-
+        policy = self._selected_policy(request)
         try:
-            pipe = self._get_sync_redis().pipeline(transaction=True)
-            # Remove old requests outside the sliding window, add the current
-            # request, count active requests, and keep Redis memory bounded.
-            pipe.zremrangebyscore(key, 0, now - self.cfg.window)
-            pipe.zadd(key, {self._member(): now})
-            pipe.zcard(key)
-            pipe.expire(key, self.cfg.window)
-            _, _, count, _ = pipe.execute()
-            count = int(count)
-            return count > self.cfg.rate, count
-        except RedisError:
-            logger.exception("Redis error during sync rate limit check")
-            if self.cfg.fail_open:
-                return False, 0
-            return True, self.cfg.rate + 1
+            if policy is not None:
+                user = (
+                    getattr(request, IDENTITY_USER, None)
+                    if any(limit.identity == IDENTITY_USER for limit in policy.limits)
+                    else None
+                )
+                return admit_sync(
+                    self._storage,
+                    policy,
+                    "http",
+                    request,
+                    self._client_ip_from_meta(request),
+                    user=user,
+                    resolver=self._identity_resolver,
+                )
+            result = self._storage.check_sync(
+                self.key_for_request(request), self.cfg.rate, self.cfg.window
+            )
+            return PolicyDecision(result, self.cfg.rate, self.cfg.window)
+        except StorageError:
+            logger.error("Storage error during sync rate limit check")
+            return self._failed(
+                policy.limits[0].rate if policy else self.cfg.rate,
+                policy.limits[0].window if policy else self.cfg.window,
+            )
 
-    async def should_limit_async(self, request: HttpRequest) -> tuple[bool, int]:
-        """Check the rate limit for an asynchronous Django request."""
+    async def _admit_async(self, request: HttpRequest) -> PolicyDecision:
         if self.is_exempt_request(request):
-            return False, 0
-
-        key = self.key_for_request(request)
-        now = time.time()
-
+            return PolicyDecision(
+                SlidingWindowResult(False, 0, self.cfg.window), self.cfg.rate, self.cfg.window
+            )
+        policy = self._selected_policy(request)
         try:
-            pipe = self._get_async_redis().pipeline(transaction=True)
-            pipe.zremrangebyscore(key, 0, now - self.cfg.window)
-            pipe.zadd(key, {self._member(): now})
-            pipe.zcard(key)
-            pipe.expire(key, self.cfg.window)
-            _, _, count, _ = await pipe.execute()
-            count = int(count)
-            return count > self.cfg.rate, count
-        except RedisError:
-            logger.exception("Redis error during async rate limit check")
-            if self.cfg.fail_open:
-                return False, 0
-            return True, self.cfg.rate + 1
+            if policy is not None:
+                user = (
+                    await self._policy_async_user(request)
+                    if any(limit.identity == IDENTITY_USER for limit in policy.limits)
+                    else None
+                )
+                return await admit_async(
+                    self._storage,
+                    policy,
+                    "http",
+                    request,
+                    self._client_ip_from_meta(request),
+                    user=user,
+                    resolver=self._identity_resolver,
+                )
+            result = await self._storage.check_async(
+                await self.async_key_for_request(request), self.cfg.rate, self.cfg.window
+            )
+            return PolicyDecision(result, self.cfg.rate, self.cfg.window)
+        except StorageError:
+            logger.error("Storage error during async rate limit check")
+            return self._failed(
+                policy.limits[0].rate if policy else self.cfg.rate,
+                policy.limits[0].window if policy else self.cfg.window,
+            )
 
-    def __call__(self, request: HttpRequest) -> Union[HttpResponseBase, Awaitable[HttpResponseBase]]:
+    def __call__(
+        self, request: HttpRequest
+    ) -> Union[HttpResponseBase, Awaitable[HttpResponseBase]]:
         """Route the request through the sync or async middleware path."""
         if self.async_mode:
             return self.__acall__(request)
@@ -220,22 +255,32 @@ class RateLimitMiddleware(BaseRateLimit):
 
     def __sync_call__(self, request: HttpRequest) -> HttpResponseBase:
         """Handle a synchronous request and add rate-limit headers."""
-        limited, count = self.should_limit_sync(request)
-        if limited:
-            return self.build_429(count)
+        decision = self._admit_sync(request)
+        result = decision.result
+        if result.limited:
+            return self.build_429(
+                result.count, decision.limit, decision.window, reset_after=result.reset_after
+            )
 
         response = self.get_response(request)
-        self.add_headers(response, count)
+        self.add_headers(
+            response, result.count, decision.limit, decision.window, reset_after=result.reset_after
+        )
         return response
 
     async def __acall__(self, request: HttpRequest) -> HttpResponseBase:
         """Handle an asynchronous request and add rate-limit headers."""
-        limited, count = await self.should_limit_async(request)
-        if limited:
-            return self.build_429(count)
+        decision = await self._admit_async(request)
+        result = decision.result
+        if result.limited:
+            return self.build_429(
+                result.count, decision.limit, decision.window, reset_after=result.reset_after
+            )
 
         response = await self.get_response(request)
-        self.add_headers(response, count)
+        self.add_headers(
+            response, result.count, decision.limit, decision.window, reset_after=result.reset_after
+        )
         return response
 
 
@@ -247,82 +292,66 @@ class ASGIRateLimitMiddleware(BaseRateLimit):
     """
 
     def __init__(self, app: Callable) -> None:
-        """Store the wrapped ASGI application and lazily create Redis later."""
+        """Store the wrapped ASGI application and configured storage adapter."""
         super().__init__()
         self.app = app
-        self._redis: Optional[AsyncRedis] = None
 
     def _get_header(self, scope, name: bytes) -> str:
-        """Return a decoded ASGI header value from ``scope``."""
-        for key, value in scope.get("headers", []):
-            if key.lower() == name:
-                return value.decode("utf-8", errors="ignore")
-        return ""
+        """Read only a single, well-formed header (reject ambiguous duplicates)."""
+        matches = [value for key, value in scope.get("headers", []) if key.lower() == name]
+        if len(matches) != 1:
+            return ""
+        try:
+            return matches[0].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return ""
 
     def _get_client_ip(self, scope) -> str:
-        """Return the client IP address from an ASGI scope."""
-        if self.cfg.trust_x_forwarded_for:
-            xff = self._get_header(scope, b"x-forwarded-for")
-            if xff:
-                return xff.split(",")[0].strip()
-        client = scope.get("client")
-        return client[0] if client else ""
+        """Use the same proxy-chain trust boundary as Django middleware."""
+        peer = scope.get("client")
+        return client_ip(
+            peer[0] if peer else None,
+            self._get_header(scope, b"x-forwarded-for"),
+            trust_forwarded=self.cfg.trust_x_forwarded_for,
+            trusted_proxies=self.cfg.trusted_proxies,
+        )
 
     def _is_exempt(self, scope) -> bool:
-        """Return ``True`` when an ASGI request/connection is exempt."""
-        path = (scope.get("path") or "").lstrip("/")
-        path_is_exempt = any(
-            path.startswith(exempt_path.lstrip("/"))
-            for exempt_path in self.cfg.exempt_paths
+        """Apply the shared exact/subtree matcher and canonical IP exemption."""
+        return is_exempt_path(scope.get("path") or "/", self.cfg.exempt_paths) or (
+            bool(self.cfg.exempt_ips) and self._get_client_ip(scope) in self.cfg.exempt_ips
         )
-        ip_is_exempt = self._get_client_ip(scope) in self.cfg.exempt_ips
-        return path_is_exempt or ip_is_exempt
 
     def _key(self, scope, suffix: str) -> str:
-        """Build the Redis key used for this ASGI scope."""
-        parts = ["ratelimit", suffix, self._get_client_ip(scope)]
-        if self.cfg.include_user_agent:
-            parts.append(self._get_header(scope, b"user-agent"))
-        return ":".join(parts)
+        """Build a bucket from an ASGI-authenticated principal or peer IP."""
+        user = scope.get(IDENTITY_USER) if self.cfg.identity_mode == IDENTITY_USER else None
+        identity = choose_identity(
+            self.cfg.identity_mode, scope, user=user, resolver=self._identity_resolver
+        )
+        return principal_key(suffix, self._get_client_ip(scope), identity)
 
-    async def _get_redis(self) -> AsyncRedis:
-        """Create or return the cached asynchronous Redis client."""
-        if self._redis is None:
-            self._redis = AsyncRedis.from_url(
-                self.cfg.redis_url,
-                socket_timeout=self.cfg.redis_timeout,
-                socket_connect_timeout=self.cfg.redis_timeout,
-                decode_responses=True,
-            )
-        return self._redis
-
-    async def _should_limit(self, key: str, limit: int, window: int) -> tuple[bool, int]:
-        """Apply the Redis sliding-window algorithm for an ASGI event."""
-        now = time.time()
-
+    async def _check(self, key: str, limit: int, window: int) -> SlidingWindowResult:
+        """Apply the chosen storage backend without blocking the event loop."""
         try:
-            pipe = (await self._get_redis()).pipeline(transaction=True)
-            pipe.zremrangebyscore(key, 0, now - window)
-            pipe.zadd(key, {f"{now}:{uuid.uuid4().hex}": now})
-            pipe.zcard(key)
-            pipe.expire(key, window)
-            _, _, count, _ = await pipe.execute()
-            count = int(count)
-            return count > limit, count
-        except RedisError:
-            logger.exception("Redis error during ASGI rate limit check")
-            if self.cfg.fail_open:
-                return False, 0
-            return True, limit + 1
+            return await self._storage.check_async(key, limit, window)
+        except StorageError:
+            logger.error("Storage error during ASGI rate limit check")
+            return SlidingWindowResult(
+                limited=not self.cfg.fail_open,
+                count=0 if self.cfg.fail_open else limit + 1,
+                reset_after=window,
+            )
 
-    def _headers(self, count: int, limit: int, window: int) -> list[tuple[bytes, bytes]]:
+    def _headers(
+        self, count: int, limit: int, window: int, *, reset_after: Optional[int] = None
+    ) -> list[tuple[bytes, bytes]]:
         """Return ASGI byte headers for rate-limit metadata."""
         if not self.cfg.enable_headers:
             return []
         return [
             (b"x-ratelimit-limit", str(limit).encode()),
             (b"x-ratelimit-remaining", str(max(0, limit - count)).encode()),
-            (b"x-ratelimit-reset", str(window).encode()),
+            (b"x-ratelimit-reset", str(window if reset_after is None else reset_after).encode()),
         ]
 
     def _too_many_requests_body(self, window: int) -> bytes:
@@ -340,39 +369,70 @@ class ASGIRateLimitMiddleware(BaseRateLimit):
             return await self.app(scope, receive, send)
 
         if scope_type == "http":
-            limited, count = await self._should_limit(
-                self._key(scope, "http"),
-                self.cfg.rate,
-                self.cfg.window,
+            policy = match_policy(
+                self.cfg.policies, scope.get("path") or "/", scope.get("method") or "GET"
             )
-            if limited:
+            limit, window = self.cfg.rate, self.cfg.window
+            if policy is not None:
+                try:
+                    decision = await admit_async(
+                        self._storage,
+                        policy,
+                        "http",
+                        scope,
+                        self._get_client_ip(scope),
+                        user=scope.get(IDENTITY_USER)
+                        if any(limit.identity == IDENTITY_USER for limit in policy.limits)
+                        else None,
+                        resolver=self._identity_resolver,
+                    )
+                    result, limit, window = decision.result, decision.limit, decision.window
+                except StorageError:
+                    logger.error("Storage error during ASGI policy check")
+                    limit, window = policy.limits[0].rate, policy.limits[0].window
+                    result = SlidingWindowResult(
+                        not self.cfg.fail_open, limit + 1 if not self.cfg.fail_open else 0, window
+                    )
+            else:
+                result = await self._check(self._key(scope, "http"), limit, window)
+            if result.limited:
                 headers = [
                     (b"content-type", b"application/json"),
-                    (b"retry-after", str(self.cfg.window).encode()),
+                    (b"retry-after", str(result.reset_after).encode()),
                 ]
-                headers += self._headers(count, self.cfg.rate, self.cfg.window)
+                headers += self._headers(
+                    result.count, limit, window, reset_after=result.reset_after
+                )
                 await send({"type": "http.response.start", "status": 429, "headers": headers})
-                await send({"type": "http.response.body", "body": self._too_many_requests_body(self.cfg.window)})
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": self._too_many_requests_body(result.reset_after),
+                    }
+                )
                 return
 
-            headers_to_add = self._headers(count, self.cfg.rate, self.cfg.window)
+            headers_to_add = self._headers(
+                result.count, limit, window, reset_after=result.reset_after
+            )
 
             async def send_wrapper(message):
-                """Append rate-limit headers to the downstream HTTP response."""
                 if message["type"] == "http.response.start" and headers_to_add:
-                    message.setdefault("headers", [])
-                    message["headers"].extend(headers_to_add)
+                    message = {
+                        **message,
+                        "headers": [*message.get("headers", ()), *headers_to_add],
+                    }
                 await send(message)
 
             return await self.app(scope, receive, send_wrapper)
 
         if self.cfg.ws_handshake:
-            limited, _ = await self._should_limit(
+            decision = await self._check(
                 self._key(scope, "ws:handshake"),
                 self.cfg.rate,
                 self.cfg.window,
             )
-            if limited:
+            if decision.limited:
                 # 4408 is commonly used by ASGI apps to mean policy/rate-limit
                 # violation, while still being an application-defined code.
                 await send({"type": "websocket.close", "code": 4408})
@@ -387,12 +447,12 @@ class ASGIRateLimitMiddleware(BaseRateLimit):
             """Rate-limit individual WebSocket receive events."""
             event = await receive()
             if event["type"] == "websocket.receive":
-                limited, _ = await self._should_limit(
+                decision = await self._check(
                     msg_key,
                     self.cfg.ws_msg_rate,
                     self.cfg.ws_msg_window,
                 )
-                if limited:
+                if decision.limited:
                     await send({"type": "websocket.close", "code": 4408})
                     return {"type": "websocket.disconnect", "code": 4408}
             return event
