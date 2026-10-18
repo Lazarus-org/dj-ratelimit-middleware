@@ -2,7 +2,12 @@ SECRET_KEY = "tests"
 ROOT_URLCONF = "tests.urls"
 USE_TZ = True
 ALLOWED_HOSTS = ["*"]
-INSTALLED_APPS = ["django.contrib.contenttypes", "ratelimit_middleware"]
+INSTALLED_APPS = [
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "ratelimit_middleware",
+]
 MIDDLEWARE = ["ratelimit_middleware.middleware.RateLimitMiddleware"]
 DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}}
 RATELIMIT_RATE = 2
