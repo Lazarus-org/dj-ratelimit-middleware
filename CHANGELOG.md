@@ -15,6 +15,7 @@ All notable changes to `dj-ratelimit-middleware` are documented here.
 - Configurable storage failure policy, HTTP 429 responses, retry information, and rate-limit response headers.
 - Strict Django system checks and startup validation for settings and backend configurations.
 - uv packaging, compatibility testing through tox, pre-commit hooks, security checks, and Redis benchmarks.
+- Tag-driven PyPI Trusted Publishing after full CI, version consistency checks, and wheel/source-distribution validation.
 
 ### Security and correctness
 

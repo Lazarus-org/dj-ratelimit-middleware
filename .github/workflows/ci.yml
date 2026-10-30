@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
   pull_request:
 
@@ -69,6 +70,8 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - run: uv sync --python 3.12 --group dev --extra redis --extra drf
+      - name: Validate distribution metadata
+        run: uv run --no-sync python scripts/check_packaging.py
       - name: Pre-commit CI hooks
         run: uv run --no-sync pre-commit run --all-files --config .pre-commit-config-ci.yaml
       - name: Build wheel

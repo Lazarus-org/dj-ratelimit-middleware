@@ -68,7 +68,14 @@ public API changes require deliberate versioning and upgrade notes.
 
 ## Reporting vulnerabilities and releases
 
-Read [SECURITY.md](SECURITY.md) for private reporting guidance. The current
-release workflow **only builds candidate artifacts** and does not publish to
-PyPI. Release and production-use decisions require maintainer approval and
-validated CI results.
+Read [SECURITY.md](SECURITY.md) for private reporting guidance. The release
+workflow builds and validates a wheel and source distribution, checks version
+consistency, and runs the full CI workflow. Manual runs on branches validate
+artifacts without publishing. Tags must exactly match `v<project.version>`;
+tag runs publish the validated distributions to PyPI after all checks pass.
+
+Configure a PyPI Trusted Publisher for this repository's `release.yml` workflow
+and the `pypi` GitHub environment. Set required reviewers on that environment
+to require maintainer approval before publishing. No publish-enable repository
+variable is required. Use Commitizen to keep the project and package versions
+in sync when preparing releases.
