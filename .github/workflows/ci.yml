@@ -52,7 +52,7 @@ jobs:
       RATELIMIT_TEST_REDIS5_URL: redis://127.0.0.1:6381/0
       RATELIMIT_TEST_MEMCACHED_URL: 127.0.0.1:11211
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python-version }}
@@ -64,7 +64,7 @@ jobs:
     name: Source and packaging checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
